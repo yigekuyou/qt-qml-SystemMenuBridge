@@ -4,6 +4,9 @@
  * 用途：在没有真实 Qt/Chromium/Firefox 应用时验证整条链路：
  *   内嵌 registrar 发现 /MenuBar/1 → AppMenuService 按 pid 绑定 → QML 渲染。
  *
+ * --menus N 会在同一条总线上导出 /MenuBar/1 .. /MenuBar/N，模拟一个进程开
+ * 多个窗口；/Control 上的 DropMenu(path) 可以在运行中"关掉一个窗口"。
+ *
  * 它不创建任何窗口（QCoreApplication），菜单树写死在代码里，
  * 点击事件会打印到 stdout，勾选项会真的切换并广播 LayoutUpdated。
  */
@@ -18,9 +21,12 @@
 #include <QDBusPendingCall>
 #include <QDBusObjectPath>
 #include <QDBusVariant>
+#include <QHash>
 #include <QList>
 #include <QTimer>
 #include <QDebug>
+
+#include <functional>
 
 namespace {
 
@@ -43,11 +49,13 @@ FakeItem makeSeparator(qint32 id)
     return item;
 }
 
-QList<FakeItem> buildTree()
+QList<FakeItem> buildTree(int windowIndex = 0)
 {
     FakeItem file;
     file.id = 1;
-    file.label = QStringLiteral("_File");
+    // 多窗口测试时用窗口序号区分，方便肉眼确认绑定到了哪个 /MenuBar/<n>
+    file.label = windowIndex > 0 ? QStringLiteral("_File %1").arg(windowIndex)
+                                 : QStringLiteral("_File");
     file.children = {
         {10, QStringLiteral("_New Window"), false, true, {}, 0, {}},
         {11, QStringLiteral("_Open…"), false, true, {}, 0, {}},
@@ -125,9 +133,9 @@ class FakeMenu : public QObject
     Q_OBJECT
 
 public:
-    explicit FakeMenu(QObject *parent = nullptr)
+    explicit FakeMenu(int windowIndex = 0, QObject *parent = nullptr)
         : QObject(parent)
-        , m_items(buildTree())
+        , m_items(buildTree(windowIndex))
     {
     }
 
@@ -311,6 +319,34 @@ QDBusVariant FakeMenuAdaptor::GetProperty(int id, const QString &name)
     return QDBusVariant(QVariant());
 }
 
+/**
+ * 测试用控制接口（/Control），用来在运行中"关掉一个窗口"：
+ *   busctl --user call <fakeapp 唯一名> /Control test.appmenu.Control DropMenu s /MenuBar/2
+ * 只服务于 --menus > 1 的多窗口场景，验证 registrar 按 pid 注销时不会
+ * 连带删掉同进程其它窗口的菜单。
+ */
+class FakeControl : public QObject
+{
+    Q_OBJECT
+    Q_CLASSINFO("D-Bus Interface", "test.appmenu.Control")
+
+public:
+    using DropHandler = std::function<bool(const QString &)>;
+
+    explicit FakeControl(DropHandler handler, QObject *parent = nullptr)
+        : QObject(parent)
+        , m_handler(std::move(handler))
+    {
+    }
+
+public Q_SLOTS:
+    bool DropMenu(const QString &path) { return m_handler && m_handler(path); }
+    void Quit() { QCoreApplication::quit(); }
+
+private:
+    DropHandler m_handler;
+};
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -328,13 +364,15 @@ int main(int argc, char *argv[])
         QStringList{QStringLiteral("w"), QStringLiteral("register-window")},
         QStringLiteral("Also call RegisterWindow(0, /MenuBar/1) (standard path, windowId 0 → pid)."));
     parser.addOption(registerWindowOption);
+    QCommandLineOption menusOption(
+        QStringList{QStringLiteral("m"), QStringLiteral("menus")},
+        QStringLiteral("Export N menu bars (/MenuBar/1 .. /MenuBar/N) on one connection, "
+                       "simulating one process with N windows."),
+        QStringLiteral("n"), QStringLiteral("1"));
+    parser.addOption(menusOption);
     parser.process(app);
 
     appmenuRegisterDBusTypes();
-
-    FakeMenu menu;
-    auto *adaptor = new FakeMenuAdaptor(&menu);
-    Q_UNUSED(adaptor)
 
     QDBusConnection bus = QDBusConnection::sessionBus();
 
@@ -346,13 +384,39 @@ int main(int argc, char *argv[])
         qCritical() << "cannot register /MenuBar";
         return 1;
     }
-    // Qt 应用导出的菜单路径就是 /MenuBar/<n>
-    if (!bus.registerObject(QStringLiteral("/MenuBar/1"), &menu)) {
-        qCritical() << "cannot register /MenuBar/1";
+
+    // Qt 应用导出的菜单路径就是 /MenuBar/<n>；一个进程开多个窗口时会有多条
+    const int menuCount = qMax(1, parser.value(menusOption).toInt());
+    QHash<QString, FakeMenu *> menus;
+    for (int i = 1; i <= menuCount; ++i) {
+        const QString path = QStringLiteral("/MenuBar/%1").arg(i);
+        auto *menu = new FakeMenu(menuCount > 1 ? i : 0, &app);
+        auto *adaptor = new FakeMenuAdaptor(menu);
+        Q_UNUSED(adaptor)
+
+        if (!bus.registerObject(path, menu)) {
+            qCritical() << "cannot register" << path;
+            return 1;
+        }
+        menus.insert(path, menu);
+    }
+
+    auto *control = new FakeControl([&bus, &menus](const QString &path) {
+        FakeMenu *menu = menus.take(path);
+        if (!menu)
+            return false;
+        bus.unregisterObject(path);
+        menu->deleteLater();
+        qInfo() << "[fakeapp] dropped menu" << path;
+        return true;
+    }, &app);
+    if (!bus.registerObject(QStringLiteral("/Control"), control,
+                            QDBusConnection::ExportAllSlots)) {
+        qCritical() << "cannot register /Control";
         return 1;
     }
 
-    qInfo() << "[fakeapp] exporting com.canonical.dbusmenu at /MenuBar/1 on" << bus.baseService();
+    qInfo() << "[fakeapp] exporting" << menuCount << "menu bar(s) on" << bus.baseService();
 
     if (parser.isSet(registerOption)) {
         QDBusMessage call = QDBusMessage::createMethodCall(

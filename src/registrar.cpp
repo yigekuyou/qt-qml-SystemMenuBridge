@@ -6,6 +6,7 @@
 #include <QDBusMessage>
 #include <QDBusMetaType>
 #include <QDBusPendingCallWatcher>
+#include <QSet>
 #include <QTimer>
 #include <QXmlStreamReader>
 #include <QDebug>
@@ -257,20 +258,36 @@ QList<AppMenuEntry> AppMenuRegistrar::entries() const
 
 AppMenuEntry AppMenuRegistrar::entryForPid(uint pid) const
 {
+    // 一个进程可能有多个窗口，每个窗口导出自己的 /MenuBar/<n>，所以同一 pid
+    // 会对应多条记录。m_menus 是 QHash，直接返回"第一条"会随哈希顺序变化；
+    // 这里固定取 path 最小的一条，让 GetMenuForPid、GetMenuForWindow 和面板
+    // 本地的 findEntryForPid 得到同一个结果（切换/刷新时不会来回跳）。
+    AppMenuEntry best;
     for (const AppMenuEntry &entry : m_menus) {
-        if (entry.pid == pid && !entry.path.isEmpty())
-            return entry;
+        if (entry.pid != pid || entry.path.isEmpty())
+            continue;
+        if (best.path.isEmpty() || entry.path < best.path)
+            best = entry;
     }
-    return {};
+    return best;
 }
 
 AppMenuEntry AppMenuRegistrar::entryForWindow(uint windowId) const
 {
+    AppMenuEntry best;
     for (const AppMenuEntry &entry : m_menus) {
-        if (entry.windowId == windowId)
-            return entry;
+        if (entry.windowId != windowId || entry.path.isEmpty())
+            continue;
+        if (best.path.isEmpty() || entry.path < best.path)
+            best = entry;
     }
-    return {};
+
+    // Wayland 下 windowId 就是 pid（见 types.h），但应用如果自己用真实 XID
+    // 注册过，windowId 就不再等于 pid。hypr-appmenu 仍按 pid 调用
+    // GetMenuForWindow，所以精确匹配不到时退回按 pid 查。
+    if (best.path.isEmpty() && windowId != 0)
+        return entryForPid(windowId);
+    return best;
 }
 
 void AppMenuRegistrar::handleRegisterWindow(uint windowId, const QString &service, const QString &path)
@@ -322,7 +339,10 @@ void AppMenuRegistrar::addOrUpdate(const AppMenuEntry &entry)
         // 真实 XID（RegisterWindow 传入）优先于 pid/合成 id
         if (entry.windowId && entry.windowId != entry.pid && entry.windowId != oldWindowId) {
             it->windowId = entry.windowId;
-            emit entryUnregistered(oldWindowId);
+            // 旧 id 只是 pid 占位时不用广播注销：按 pid 绑定的客户端本来就不看它，
+            // 广播反而会让面板短暂以为整个进程的菜单没了
+            if (oldWindowId != it->pid)
+                emit entryUnregistered(oldWindowId);
             emit entryRegistered(*it);
         } else if (it->windowId == 0) {
             it->windowId = entry.windowId;
@@ -337,23 +357,51 @@ void AppMenuRegistrar::addOrUpdate(const AppMenuEntry &entry)
     emit entryRegistered(entry);
 }
 
-void AppMenuRegistrar::dropEntriesOwnedBy(uint windowId)
+void AppMenuRegistrar::dropEntriesOwnedBy(uint id)
 {
-    QList<AppMenuEntry> removed;
-    for (auto it = m_menus.begin(); it != m_menus.end();) {
-        // UnregisterWindow 既可能收到 XID，也可能收到 pid（hypr-appmenu 的行为）
-        if (it->windowId == windowId || (windowId != 0 && it->pid == windowId)) {
-            removed.append(*it);
-            it = m_menus.erase(it);
-        } else {
-            ++it;
+    if (id == 0)
+        return;
+
+    // 1) 真实 windowId（X11 XID / 合成 id）优先
+    QList<AppMenuEntry> matches;
+    for (const AppMenuEntry &entry : std::as_const(m_menus)) {
+        if (entry.windowId == id)
+            matches.append(entry);
+    }
+
+    // 2) 没有 windowId 命中时，按 hypr-appmenu 的 UnregisterWindow(pid) 语义
+    if (matches.isEmpty()) {
+        for (const AppMenuEntry &entry : std::as_const(m_menus)) {
+            if (entry.pid == id)
+                matches.append(entry);
         }
     }
 
-    for (const AppMenuEntry &entry : std::as_const(removed)) {
-        qInfo().nospace() << "appmenu: menu gone " << entry.service << " " << entry.path;
-        emit entryUnregistered(entry.windowId);
+    if (matches.isEmpty())
+        return;
+
+    // Wayland 下 windowId 就是 pid，一个进程开多个窗口时这些条目共享同一个 id。
+    // 关掉一个窗口时根本无从判断关的是哪一个：不能把兄弟窗口的菜单一起删掉
+    // （那会让应用剩下的窗口在没有菜单的状态下等 60s 重扫）。这里改为重新
+    // Introspect 对账，syncMenus 只删真正消失的 path。
+    if (matches.size() > 1) {
+        QSet<QString> services;
+        for (const AppMenuEntry &entry : std::as_const(matches))
+            services.insert(entry.service);
+
+        qInfo().noquote() << "appmenu: unregister" << id << "matches" << matches.size()
+                          << "menus, re-probing" << services.size() << "service(s)";
+        for (const QString &service : std::as_const(services)) {
+            m_services.insert(service);
+            probe(service, 0);
+        }
+        return;
     }
+
+    const AppMenuEntry entry = matches.first();
+    m_menus.remove(menuKey(entry.service, entry.path));
+    qInfo().nospace() << "appmenu: menu gone " << entry.service << " " << entry.path;
+    emit entryUnregistered(entry.windowId);
 }
 
 void AppMenuRegistrar::removeService(const QString &service)

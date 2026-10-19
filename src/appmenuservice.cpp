@@ -212,11 +212,17 @@ void AppMenuService::reload()
 
 AppMenuEntry AppMenuService::findEntryForPid(uint pid) const
 {
+    // 同一进程的多个窗口会有多条记录（同一个 pid、不同 path）。这里和
+    // AppMenuRegistrar::entryForPid 用同一条规则（取 path 最小的一条），
+    // 免得本地列表和 registrar 的 GetMenuForPid 结果不一致导致来回跳。
+    AppMenuEntry best;
     for (const AppMenuEntry &entry : m_entries) {
-        if (entry.pid == pid && !entry.path.isEmpty())
-            return entry;
+        if (entry.pid != pid || entry.path.isEmpty())
+            continue;
+        if (best.path.isEmpty() || entry.path < best.path)
+            best = entry;
     }
-    return {};
+    return best;
 }
 
 void AppMenuService::applyActive(const AppMenuEntry &entry)

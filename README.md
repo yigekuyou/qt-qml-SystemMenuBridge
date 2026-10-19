@@ -202,6 +202,10 @@ onActivePidChanged: {
 ```bash
 # 假应用：导出一份 File/Edit/View 菜单（点击事件打印到 stdout）
 ./build/test/appmenu-fakeapp
+# 一个连接上导出 /MenuBar/1 .. /MenuBar/N，模拟同进程多窗口
+./build/test/appmenu-fakeapp --menus 2
+# 运行中"关掉一个窗口"（测试注销逻辑，路径 /MenuBar/2 只是示例）
+busctl --user call :1.x /Control test.appmenu.Control DropMenu s /MenuBar/2
 # 走 RegisterSurfaceMenu(uss)，模拟 hypr-appmenu 插件
 ./build/test/appmenu-fakeapp --register
 
@@ -218,9 +222,14 @@ APPMENU_TEST_SCREENSHOT=/tmp/menu.png ./build/test/appmenu-test --pid 1234
 
 * **X11**：以 pid 为关联键（Wayland 没有 XID）。X11 客户端仍可用
   `RegisterWindow(XID, path)`，注册表保留真实 XID，`GetMenuForWindow` 可用。
-* **同一进程多窗口**：不同窗口菜单路径可能不同，但 pid 只有一个，`GetMenuForPid`
-  返回第一条。要更精细需叠加 `memtable/hypr-appmenu` 插件（它通过
-  `org_kde_kwin_appmenu` 拿 surface→pid，再调 `RegisterSurfaceMenu`）。
+* **同一进程多窗口**：一个进程的每个窗口会导出自己的 `/MenuBar/<n>`，但 Wayland
+  下能拿到的关联键只有 pid，所以无法判断焦点窗口对应哪一个。当前策略：
+  * 同一 pid 有多条记录时，`GetMenuForPid` / `GetMenuForWindow` / 面板本地查找
+    统一取 **path 最小**的一条（不是 QHash 顺序），结果确定、切换和刷新不会来回跳；
+  * `UnregisterWindow(pid)` 命中多条时不再把该进程的菜单全部删掉（那会让同一应用
+    剩下的窗口失去菜单），而是重新 `Introspect` 对账，只移除真正消失的 path；
+  * 真正的窗口级绑定需要 `org_kde_kwin_appmenu`（应用把菜单挂到 surface 上），
+    Hyprland 不实现该协议，需要合成器插件支持。
 * **GTK**：经典 `GtkMenuBar` 需要 `appmenu-gtk-module`；纯 Wayland 上游不支持
   （无 XID），要 `rocka/appmenu-gtk-module-wayland` 之类的 fork。
   `GtkApplication` 的 GMenu（`org.gtk.Menus`）是另一套协议，本项目未处理。
