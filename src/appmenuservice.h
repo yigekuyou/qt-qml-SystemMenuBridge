@@ -9,6 +9,7 @@
 #include <qqmlregistration.h>
 
 #include "dbusmenumodel.h"
+class AppMenuRegistrar;
 class QDBusServiceWatcher;
 class QTimer;
 
@@ -36,6 +37,7 @@ class AppMenuService : public QObject
     QML_ELEMENT
 
     Q_PROPERTY(bool available READ available NOTIFY availableChanged)
+    Q_PROPERTY(bool ownsRegistrar READ ownsRegistrar NOTIFY ownsRegistrarChanged)
     Q_PROPERTY(QVariantList menus READ menus NOTIFY menusChanged)
     Q_PROPERTY(uint activePid READ activePid NOTIFY activeChanged)
     Q_PROPERTY(QString activeService READ activeService NOTIFY activeChanged)
@@ -47,6 +49,8 @@ public:
     ~AppMenuService() override;
 
     bool available() const;
+    /// 本进程是否占住了 com.canonical.AppMenu.Registrar
+    bool ownsRegistrar() const;
     QVariantList menus() const;
     uint activePid() const;
     QString activeService() const;
@@ -62,6 +66,7 @@ public:
 
 Q_SIGNALS:
     void availableChanged();
+    void ownsRegistrarChanged();
     void menusChanged();
     void activeChanged();
     void menuModelChanged();
@@ -73,6 +78,9 @@ private Q_SLOTS:
 
 private:
     void setAvailable(bool value);
+    void setOwnsRegistrar(bool value);
+    /// 没人占用 registrar 名字时，就在本进程里把它占住（不再需要单独的守护进程）
+    void startEmbeddedRegistrar();
     void scheduleReload();
     void applyActive(const AppMenuEntry &entry);
     AppMenuEntry findEntryForPid(uint pid) const;
@@ -81,8 +89,10 @@ private:
     QTimer *m_reloadTimer = nullptr;
     QList<AppMenuEntry> m_entries;
     DBusMenuModel *m_model = nullptr;
+    AppMenuRegistrar *m_registrar = nullptr;
 
     bool m_available = false;
+    bool m_ownsRegistrar = false;
     uint m_activePid = 0;
     uint m_pendingPid = 0;
     QString m_activeService;

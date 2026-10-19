@@ -235,7 +235,7 @@ bool AppMenuRegistrar::start(QString *errorMessage, bool replaceExisting)
     });
     rescan->start();
 
-    qInfo() << "appmenu-registrar: owning" << kRegistrarService << "at" << kRegistrarPath;
+    qInfo() << "appmenu: owning" << kRegistrarService << "at" << kRegistrarPath;
     return true;
 }
 
@@ -327,7 +327,7 @@ void AppMenuRegistrar::addOrUpdate(const AppMenuEntry &entry)
     }
 
     m_menus.insert(key, entry);
-    qInfo().nospace() << "appmenu-registrar: menu " << entry.service << " " << entry.path
+    qInfo().nospace() << "appmenu: menu " << entry.service << " " << entry.path
                       << " pid=" << entry.pid << " window=" << entry.windowId;
     emit entryRegistered(entry);
 }
@@ -346,7 +346,7 @@ void AppMenuRegistrar::dropEntriesOwnedBy(uint windowId)
     }
 
     for (const AppMenuEntry &entry : std::as_const(removed)) {
-        qInfo().nospace() << "appmenu-registrar: menu gone " << entry.service << " " << entry.path;
+        qInfo().nospace() << "appmenu: menu gone " << entry.service << " " << entry.path;
         emit entryUnregistered(entry.windowId);
     }
 }
@@ -364,7 +364,7 @@ void AppMenuRegistrar::removeService(const QString &service)
     }
 
     for (const AppMenuEntry &entry : std::as_const(removed)) {
-        qInfo().nospace() << "appmenu-registrar: service left " << entry.service;
+        qInfo().nospace() << "appmenu: service left " << entry.service;
         emit entryUnregistered(entry.windowId);
     }
 }
@@ -411,7 +411,7 @@ void AppMenuRegistrar::scanExistingNames()
             m_services.insert(name);
             probe(name, 0);
         }
-        qInfo() << "appmenu-registrar: scanning" << m_services.size() << "bus connections";
+        qInfo() << "appmenu: scanning" << m_services.size() << "bus connections";
     });
 }
 

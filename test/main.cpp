@@ -6,7 +6,7 @@
 
 /**
  * appmenu-test —— 用一条顶栏验证整条链路：
- *   appmenu-registrar → AppMenuService(pid) → DBusMenuModel → QML 渲染
+ *   内嵌 registrar → AppMenuService(pid) → DBusMenuModel → QML 渲染
  *
  * 设置 APPMENU_TEST_SCREENSHOT=/tmp/menu.png 时会在 1.5s 后截图并退出，
  * 方便在无头环境做冒烟测试。

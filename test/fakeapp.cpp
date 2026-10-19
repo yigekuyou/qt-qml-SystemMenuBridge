@@ -2,7 +2,7 @@
  * appmenu-fakeapp —— 一个只导出 com.canonical.dbusmenu 的"假应用"
  *
  * 用途：在没有真实 Qt/Chromium/Firefox 应用时验证整条链路：
- *   appmenu-registrar 发现 /MenuBar/1 → AppMenuService 按 pid 绑定 → QML 渲染。
+ *   内嵌 registrar 发现 /MenuBar/1 → AppMenuService 按 pid 绑定 → QML 渲染。
  *
  * 它不创建任何窗口（QCoreApplication），菜单树写死在代码里，
  * 点击事件会打印到 stdout，勾选项会真的切换并广播 LayoutUpdated。

@@ -1,17 +1,63 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(appmenu VERSION 0.1 LANGUAGES CXX)
+project(appmenu VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(GNUInstallDirs)
+
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core DBus Qml Quick)
+qt_standard_project_setup(REQUIRES 6.5)
 
-qt_standard_project_setup()
+# ---------------------------------------------------------------------------
+# QML 模块
+#
+# 这个工程只提供 QML 接口，没有可执行文件：
+#   DBusMenuModel  一层菜单模型（com.canonical.dbusmenu 客户端）
+#   AppMenuService pid → 菜单绑定
+#   AppMenu        QML 单例（C++ 实现，工程里没有 .qml 文件）
+#
+# registrar（com.canonical.AppMenu.Registrar）不是独立进程：AppMenuService
+# 启动时如果这个名字没人占，就在本进程里占住，顺带做菜单发现。
+# ---------------------------------------------------------------------------
+set(APPMENU_URI "com.github.yigekuyou.appmenu")
 
-# QML 模块统一输出到 <build>/qml，运行时用 QML_IMPORT_PATH 指过去即可
-# （test/main.cpp 里已经通过 ${CMAKE_BINARY_DIR}/qml 自动加好了）
-set(QT_QML_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/qml)
+qt_add_library(appmenu SHARED)
 
-add_subdirectory(src)
-add_subdirectory(test)
+qt_add_qml_module(appmenu
+    URI ${APPMENU_URI}
+    VERSION 1.0
+    OUTPUT_DIRECTORY ${APPMENU_BUILD_DIR}
+    DEPENDENCIES QtQml
+    SOURCES
+        src/types.h          src/types.cpp
+        src/dbusmenumodel.h  src/dbusmenumodel.cpp
+        src/appmenuservice.h src/appmenuservice.cpp
+        src/registrar.h      src/registrar.cpp
+        src/appmenu.h        src/appmenu.cpp
+)
+
+target_include_directories(appmenu PRIVATE src)
+target_link_libraries(appmenu PRIVATE Qt6::Core Qt6::DBus Qt6::Qml)
+
+
+install(TARGETS appmenu appmenuplugin
+    RUNTIME DESTINATION ${APPMENU_QML_DIR}
+    LIBRARY DESTINATION ${APPMENU_QML_DIR}
+)
+install(FILES
+    ${APPMENU_BUILD_DIR}/qmldir
+    ${APPMENU_BUILD_DIR}/appmenu.qmltypes
+    DESTINATION ${APPMENU_QML_DIR}
+)
+
+# ---------------------------------------------------------------------------
+# 测试 / 演示（可关掉：-DAPPMENU_BUILD_TESTS=OFF）
+# ---------------------------------------------------------------------------
+option(APPMENU_BUILD_TESTS "构建 test/ 下的演示程序与假应用" ON)
+
+if(APPMENU_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+endif()

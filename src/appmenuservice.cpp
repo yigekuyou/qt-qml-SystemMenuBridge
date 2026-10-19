@@ -1,5 +1,6 @@
 #include "appmenuservice.h"
 #include "dbusmenumodel.h"
+#include "registrar.h"
 
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
@@ -34,6 +35,10 @@ AppMenuService::AppMenuService(QObject *parent)
     connect(m_watcher, &QDBusServiceWatcher::serviceUnregistered,
             this, &AppMenuService::onRegistrarVanished);
 
+    // 没有别人的 registrar 就自己占名：这样不需要再跑一个 appmenu-registrar 守护进程，
+    // 菜单照样能被导出（Qt 只认这条总线名在不在，不关心是谁占着）。
+    startEmbeddedRegistrar();
+
     const bool present = QDBusConnection::sessionBus().interface()
                              && QDBusConnection::sessionBus().interface()->isServiceRegistered(
                                  QString::fromLatin1(kRegistrarService));
@@ -46,6 +51,38 @@ AppMenuService::~AppMenuService() = default;
 bool AppMenuService::available() const
 {
     return m_available;
+}
+
+bool AppMenuService::ownsRegistrar() const
+{
+    return m_ownsRegistrar;
+}
+
+void AppMenuService::setOwnsRegistrar(bool value)
+{
+    if (m_ownsRegistrar == value)
+        return;
+    m_ownsRegistrar = value;
+    emit ownsRegistrarChanged();
+}
+
+void AppMenuService::startEmbeddedRegistrar()
+{
+    // APPMENU_NO_REGISTRAR=1：只当客户端，用别人（hypr-appmenu / KDE）的 registrar
+    if (!qEnvironmentVariableIsEmpty("APPMENU_NO_REGISTRAR"))
+        return;
+
+    auto *registrar = new AppMenuRegistrar(this);
+    QString error;
+    if (registrar->start(&error, false)) {
+        m_registrar = registrar;
+        setOwnsRegistrar(true);
+        return;
+    }
+
+    // 名字已经被别人占了（另一个 Quickshell 实例、KDE plasma 的 registrar ……）
+    delete registrar;
+    qInfo().noquote() << "appmenu: using the existing registrar (" << error << ")";
 }
 
 QVariantList AppMenuService::menus() const
@@ -96,6 +133,13 @@ void AppMenuService::onRegistrarAppeared()
     setAvailable(true);
 
     QDBusConnection bus = QDBusConnection::sessionBus();
+    // 内嵌 registrar 上线时 QDBusServiceWatcher 也会通知一次，这里先断开避免重复连接
+    bus.disconnect(QString::fromLatin1(kRegistrarService), QString::fromLatin1(kRegistrarPath),
+                   QString::fromLatin1(kRegistrarInterface), QStringLiteral("WindowRegistered"),
+                   this, SLOT(onRegistrarSignal(QDBusMessage)));
+    bus.disconnect(QString::fromLatin1(kRegistrarService), QString::fromLatin1(kRegistrarPath),
+                   QString::fromLatin1(kRegistrarInterface), QStringLiteral("WindowUnregistered"),
+                   this, SLOT(onRegistrarSignal(QDBusMessage)));
     bus.connect(QString::fromLatin1(kRegistrarService), QString::fromLatin1(kRegistrarPath),
                 QString::fromLatin1(kRegistrarInterface), QStringLiteral("WindowRegistered"),
                 this, SLOT(onRegistrarSignal(QDBusMessage)));
