@@ -11,6 +11,17 @@ find_package(Qt6 6.5 REQUIRED COMPONENTS Core DBus Qml Quick)
 qt_standard_project_setup(REQUIRES 6.5)
 
 # ---------------------------------------------------------------------------
+# 输出目录 / 安装目录
+# ---------------------------------------------------------------------------
+set(APPMENU_BUILD_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/qml"
+    CACHE PATH "Directory for generated QML module files")
+
+set(APPMENU_QML_DIR
+    "${CMAKE_INSTALL_LIBDIR}/qt6/qml/com/github/yigekuyou/appmenu"
+    CACHE PATH "Install directory for the QML module")
+
+# ---------------------------------------------------------------------------
 # QML 模块
 #
 # 这个工程只提供 QML 接口，没有可执行文件：
@@ -39,13 +50,27 @@ qt_add_qml_module(appmenu
 )
 
 target_include_directories(appmenu PRIVATE src)
-target_link_libraries(appmenu PRIVATE Qt6::Core Qt6::DBus Qt6::Qml)
+target_link_libraries(appmenu PRIVATE Qt6::Core Qt6::DBus Qt6::Qml Qt6::Quick)
 
+set_target_properties(appmenu PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 0
+)
 
+# 主库和插件都装到同一个 QML 目录，插件通过 $ORIGIN 找主库
+set_target_properties(appmenu appmenuplugin PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+)
+
+# ---------------------------------------------------------------------------
+# 安装
+# ---------------------------------------------------------------------------
 install(TARGETS appmenu appmenuplugin
     RUNTIME DESTINATION ${APPMENU_QML_DIR}
     LIBRARY DESTINATION ${APPMENU_QML_DIR}
+    ARCHIVE DESTINATION ${APPMENU_QML_DIR}
 )
+
 install(FILES
     ${APPMENU_BUILD_DIR}/qmldir
     ${APPMENU_BUILD_DIR}/appmenu.qmltypes
