@@ -201,6 +201,11 @@ bool AppMenuRegistrar::start(QString *errorMessage, bool replaceExisting)
         return false;
     }
 
+    // 引擎热重载（Quickshell 保存配置即重载）时，旧 QML 单例尚未销毁，
+    // 旧 registrar 对象仍占着这条对象路径，同一条连接上重复注册必然失败。
+    // 先反注册一次自己连接上的旧对象（没有也无副作用），再注册。
+    bus.unregisterObject(QString::fromLatin1(kRegistrarPath));
+
     if (!bus.registerObject(QString::fromLatin1(kRegistrarPath), this,
                             QDBusConnection::ExportAdaptors)) {
         if (errorMessage)
