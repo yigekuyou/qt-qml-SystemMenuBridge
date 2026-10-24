@@ -8,7 +8,10 @@
 #include <QDBusObjectPath>
 #include <QHash>
 #include <QObject>
+#include <QQueue>
 #include <QSet>
+#include <QTimer>
+#include <QString>
 
 class AppMenuRegistrar;
 
@@ -101,12 +104,32 @@ private:
     uint pidOf(const QString &service) const;
     uint nextSyntheticId();
 
+    /// 一次排队等发车的 Introspect。所有探测都从这里走：开机会话里有上百条
+    /// 总线连接，一次性齐发会在总线上打出一波尖峰，也会让 broker 的未读消息
+    /// 记账暴涨（见 registrar.cpp 里 kProbeTimeoutMs 的说明）。
+    struct ProbeRequest {
+        QString service;
+        int attempt = 0;
+    };
+    void enqueueProbe(const QString &service, int attempt);
+    void pumpProbeQueue();
+    void noteProbeTimeout(const QString &service);
+    bool probeSuppressed(const QString &service) const;
+
     RegistrarAdaptor *m_adaptor = nullptr;
     QHash<QString, AppMenuEntry> m_menus; // key = service|path
     QHash<QString, int> m_probeAttempts;
     QSet<QString> m_services; // 当前在总线上的唯一名
     QString m_ownUniqueName;
     uint m_synthetic = 0x80000000u;
+
+    QQueue<ProbeRequest> m_probeQueue;
+    QTimer *m_pump = nullptr;   // 探测发车节流用的单次定时器
+    int m_inFlight = 0;         // 还没回来的 Introspect 数
+    QSet<QString> m_unreachable;        // 叫不醒的连接：owner 变化前不再探测
+    QHash<QString, int> m_timeouts;     // 连续超时次数
+    QHash<QString, qint64> m_retryAfter; // 下次最早可以再试的时间（ms since epoch）
+    mutable QHash<QString, uint> m_pidCache;
 };
 
 #endif // REGISTRAR_H

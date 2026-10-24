@@ -1,5 +1,6 @@
 #include "registrar.h"
 
+#include <QDateTime>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
 #include <QDBusReply>
@@ -23,6 +24,23 @@ constexpr int kMaxProbeAttempts = 15;
 constexpr int kProbeIntervalMs = 2000;
 // 之后每 60s 低频重扫一次，兜住"多窗口应用后来才导出 /MenuBar/2"这类情况
 constexpr int kRescanIntervalMs = 60000;
+
+// 单次 Introspect 的上限。Qt 默认是 25s：总线上长期存在一些不跑事件循环的
+// 连接（Qt 里跨线程 QDBusConnection 很常见），对它们探测时调用会一直挂着，
+// broker 替收发两端攒的未读消息越堆越多，攒过配额就把连接踢下线 —— 桌面
+// 会话里最先遭殃的往往就是往总线上发请求的那个进程。给每次探测加硬超时，
+// 挂起的调用最多堆 kMaxConcurrentProbes 个、每个 1.5s。
+constexpr int kProbeTimeoutMs = 1500;
+
+// 探测节流：同时最多 kMaxConcurrentProbes 个在飞，两次发车至少隔 kProbePumpMs。
+// 开机会话里有上百条连接，一次性齐发会把总线打出一波尖峰。
+constexpr int kMaxConcurrentProbes = 4;
+constexpr int kProbePumpMs = 120;
+
+// 同一条连接连续超时这么多次就判定为"叫不醒"，在它的 owner 变化前不再探测，
+// 否则每 60s 的重扫会给这些死连接一直续期未读消息。
+constexpr int kMaxProbeTimeouts = 3;
+constexpr int kTimeoutBackoffMs = 60000;
 
 /**
  * 解析 Introspect /MenuBar 的结果。现实中有两种导出方式，都要认：
@@ -221,22 +239,27 @@ bool AppMenuRegistrar::start(QString *errorMessage, bool replaceExisting)
                 QStringLiteral("org.freedesktop.DBus"), QStringLiteral("NameOwnerChanged"),
                 this, SLOT(onNameOwnerChanged(QString, QString, QString)));
 
+    // 探测队列的发车定时器：一拍最多放一个探测出去
+    m_pump = new QTimer(this);
+    m_pump->setSingleShot(true);
+    m_pump->setInterval(kProbePumpMs);
+    connect(m_pump, &QTimer::timeout, this, &AppMenuRegistrar::pumpProbeQueue);
+
     scanExistingNames();
 
-    // 低频重扫：只针对还没发现菜单的服务
+    // 低频重扫：只针对还没发现菜单的服务，而且每次只补一枪（attempt 已达上限，
+    // 不会再触发 2s 一串的重试），用慢速轮询等应用后来才导出的菜单。
     auto *rescan = new QTimer(this);
     rescan->setInterval(kRescanIntervalMs);
     connect(rescan, &QTimer::timeout, this, [this]() {
+        QSet<QString> withMenu;
+        for (const AppMenuEntry &entry : std::as_const(m_menus))
+            withMenu.insert(entry.service);
+
         for (const QString &service : std::as_const(m_services)) {
-            bool hasMenu = false;
-            for (const AppMenuEntry &entry : std::as_const(m_menus)) {
-                if (entry.service == service) {
-                    hasMenu = true;
-                    break;
-                }
-            }
-            if (!hasMenu)
-                probe(service, 0);
+            if (withMenu.contains(service) || probeSuppressed(service))
+                continue;
+            enqueueProbe(service, kMaxProbeAttempts);
         }
     });
     rescan->start();
@@ -393,7 +416,7 @@ void AppMenuRegistrar::dropEntriesOwnedBy(uint id)
                           << "menus, re-probing" << services.size() << "service(s)";
         for (const QString &service : std::as_const(services)) {
             m_services.insert(service);
-            probe(service, 0);
+            enqueueProbe(service, 0);
         }
         return;
     }
@@ -424,11 +447,25 @@ void AppMenuRegistrar::removeService(const QString &service)
 
 uint AppMenuRegistrar::pidOf(const QString &service) const
 {
-    auto *iface = QDBusConnection::sessionBus().interface();
-    if (!iface)
-        return 0;
-    const QDBusReply<uint> reply = iface->servicePid(service);
-    return reply.isValid() ? reply.value() : 0;
+    const auto cached = m_pidCache.constFind(service);
+    if (cached != m_pidCache.constEnd())
+        return cached.value();
+
+    // servicePid() 是走连接默认 25s 超时的同步调用；这里手搓一条带硬超时的，
+    // 免得某个应用刚好卡住时把 GUI 线程按在那里。结果缓存，owner 变化时作废。
+    QDBusMessage call = QDBusMessage::createMethodCall(
+        QStringLiteral("org.freedesktop.DBus"), QStringLiteral("/org/freedesktop/DBus"),
+        QStringLiteral("org.freedesktop.DBus"), QStringLiteral("GetConnectionUnixProcessID"));
+    call << service;
+
+    const QDBusMessage reply =
+        QDBusConnection::sessionBus().call(call, QDBus::Block, kProbeTimeoutMs);
+    const QVariantList args = reply.arguments();
+    const uint pid = reply.type() == QDBusMessage::ReplyMessage && !args.isEmpty()
+            ? args.at(0).toUInt() : 0u;
+    if (pid != 0)
+        m_pidCache.insert(service, pid);
+    return pid;
 }
 
 uint AppMenuRegistrar::nextSyntheticId()
@@ -462,9 +499,12 @@ void AppMenuRegistrar::scanExistingNames()
             if (name == m_ownUniqueName)
                 continue;
             m_services.insert(name);
-            probe(name, 0);
+            // 开机扫描：这些应用早就跑起来了，没必要每个都给 15 次 2s 重试，
+            // 一次不中就交给 60s 重扫；只有 NameOwnerChanged 新出现的名字
+            // （应用刚启动）才走完整的重试链。
+            enqueueProbe(name, kMaxProbeAttempts);
         }
-        qInfo() << "appmenu: scanning" << m_services.size() << "bus connections";
+        qInfo() << "appmenu: scanning" << m_services.size() << "bus connections (throttled)";
     });
 }
 
@@ -474,35 +514,52 @@ void AppMenuRegistrar::scheduleProbe(const QString &service, int attempt)
     QTimer::singleShot(kProbeIntervalMs, this, [this, service, attempt]() {
         if (!m_services.contains(service))
             return; // 名字已经消失
-        probe(service, attempt);
+        enqueueProbe(service, attempt);
     });
 }
 
 void AppMenuRegistrar::probe(const QString &service, int attempt)
 {
-    if (!m_services.contains(service))
+    if (!m_services.contains(service) || probeSuppressed(service))
         return;
 
     QDBusMessage call = QDBusMessage::createMethodCall(
         service, QString::fromLatin1(kMenuBarPath),
         QStringLiteral("org.freedesktop.DBus.Introspectable"), QStringLiteral("Introspect"));
-
-    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(call), this);
+    ++m_inFlight;
+    // 必须自带超时：连接默认是 25s，碰上一声不吭的对端会把挂起调用越堆越多，
+    // broker 替两边攒的未读消息也跟着涨。
+    auto *watcher = new QDBusPendingCallWatcher(
+        QDBusConnection::sessionBus().asyncCall(call, kProbeTimeoutMs), this);
     connect(watcher, &QDBusPendingCallWatcher::finished, this,
             [this, service, attempt](QDBusPendingCallWatcher *w) {
                 w->deleteLater();
+                if (m_inFlight > 0)
+                    --m_inFlight;
+                pumpProbeQueue(); // 有空位了，放下一枪
 
                 if (!m_services.contains(service))
                     return;
 
-                const QDBusMessage reply = w->reply();
-                if (reply.type() == QDBusMessage::ErrorMessage) {
+                if (w->isError()) {
+                    const QString errorName = w->error().name();
+                    const bool silent = errorName == QLatin1String("org.freedesktop.DBus.Error.NoReply")
+                            || errorName == QLatin1String("org.freedesktop.DBus.Error.Timeout")
+                            || errorName == QLatin1String("org.freedesktop.DBus.Error.TimedOut");
+                    if (silent) {
+                        // 对端根本没在读消息，重试只会继续给它堆未读
+                        noteProbeTimeout(service);
+                        return;
+                    }
+
                     // 这个连接没有导出 /MenuBar，稍后再试几次
+                    m_timeouts.remove(service);
                     if (attempt < kMaxProbeAttempts)
                         scheduleProbe(service, attempt + 1);
                     return;
                 }
 
+                const QDBusMessage reply = w->reply();
                 const QVariantList args = reply.arguments();
                 const QString xml = args.isEmpty() ? QString() : args.at(0).toString();
                 const MenuBarIntrospection introspection = parseMenuBarIntrospection(xml);
@@ -518,8 +575,69 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                 }
 
                 m_probeAttempts.remove(service);
+                m_timeouts.remove(service);
+                m_retryAfter.remove(service);
                 syncMenus(service, paths);
             });
+}
+
+void AppMenuRegistrar::enqueueProbe(const QString &service, int attempt)
+{
+    if (!m_services.contains(service) || probeSuppressed(service))
+        return;
+
+    ProbeRequest req;
+    req.service = service;
+    req.attempt = attempt;
+    m_probeQueue.enqueue(req);
+    pumpProbeQueue();
+}
+
+void AppMenuRegistrar::pumpProbeQueue()
+{
+    while (!m_probeQueue.isEmpty()) {
+        if (m_inFlight >= kMaxConcurrentProbes)
+            return; // 满了，等某个探测回来时再发车
+
+        const ProbeRequest req = m_probeQueue.dequeue();
+        if (!m_services.contains(req.service) || probeSuppressed(req.service))
+            continue; // 名字没了 / 已经判定叫不醒
+
+        probe(req.service, req.attempt);
+        if (m_pump)
+            m_pump->start(); // 一拍只放一个，剩下的排队
+        return;
+    }
+}
+
+bool AppMenuRegistrar::probeSuppressed(const QString &service) const
+{
+    if (m_unreachable.contains(service))
+        return true;
+
+    const auto it = m_retryAfter.constFind(service);
+    return it != m_retryAfter.constEnd() && QDateTime::currentMSecsSinceEpoch() < it.value();
+}
+
+void AppMenuRegistrar::noteProbeTimeout(const QString &service)
+{
+    const int count = m_timeouts.value(service) + 1;
+    m_timeouts.insert(service, count);
+
+    if (count >= kMaxProbeTimeouts) {
+        // 判定为叫不醒：在它的 owner 变化（应用重启、换连接）之前不再探测。
+        // 总线上这种连接常年存在（Qt 多线程 QDBusConnection、沙箱里的代理等），
+        // 每 60s 重扫一次只会一直给 broker 续期未读消息，攒过配额就是断线。
+        m_unreachable.insert(service);
+        m_retryAfter.remove(service);
+        m_probeAttempts.remove(service);
+        qInfo().noquote() << "appmenu: giving up on unresponsive connection" << service
+                          << "after" << count << "timeouts";
+        return;
+    }
+
+    m_retryAfter.insert(service,
+                        QDateTime::currentMSecsSinceEpoch() + qint64(kTimeoutBackoffMs) * count);
 }
 
 void AppMenuRegistrar::syncMenus(const QString &service, const QStringList &paths)
@@ -556,6 +674,7 @@ void AppMenuRegistrar::syncMenus(const QString &service, const QStringList &path
 void AppMenuRegistrar::onNameOwnerChanged(const QString &name, const QString &oldOwner,
                                           const QString &newOwner)
 {
+    Q_UNUSED(oldOwner)
     if (name == QLatin1String(kRegistrarService) || name == m_ownUniqueName
         || name == QLatin1String("org.freedesktop.DBus")) {
         return;
@@ -567,10 +686,19 @@ void AppMenuRegistrar::onNameOwnerChanged(const QString &name, const QString &ol
         if (m_services.contains(name))
             return;
         m_services.insert(name);
-        probe(name, 0);
+        // 换了一个 owner，之前"叫不醒"的判断作废，重新给机会
+        m_unreachable.remove(name);
+        m_timeouts.remove(name);
+        m_retryAfter.remove(name);
+        m_pidCache.remove(name);
+        enqueueProbe(name, 0);
     } else {
         m_services.remove(name);
         m_probeAttempts.remove(name);
+        m_unreachable.remove(name);
+        m_timeouts.remove(name);
+        m_retryAfter.remove(name);
+        m_pidCache.remove(name);
         removeService(name);
     }
 }
