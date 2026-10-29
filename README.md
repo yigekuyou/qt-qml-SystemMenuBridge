@@ -58,7 +58,7 @@ APPMENU_NO_REGISTRAR=1 qs
 │   ├── registrar.h/.cpp      registrar 实现（占名 + 发现 + 注册表，进程内）
 │   └── appmenu.h/.cpp        QML 单例 AppMenu（C++ 实现）
 ├── test/                     测试 / 演示（唯一有 .qml 的地方，可关掉）
-│   ├── fakeapp.cpp           假应用：导出 /MenuBar/1
+│   ├── fakeapp.cpp           假应用：导出 /MenuBar/1（--tray 模拟托盘菜单）
 │   ├── main.cpp              appmenu-test 入口
 │   ├── Main.qml              顶栏演示
 │   └── MenuPopup.qml         递归菜单弹窗
@@ -102,6 +102,19 @@ QML 模块对外只有三个类型：
 所以探测时先 `Introspect /MenuBar`：XML 里有 `com.canonical.dbusmenu` 接口就收
 `/MenuBar`，有子节点就收 `/MenuBar/<n>`。应用可能启动几秒后才建菜单栏，因此对
 新出现的连接做有限次重试（2s × 15），之后每 60s 低频重扫一次没有菜单的连接。
+
+同一个 pid 往往还会多出一份**托盘图标上下文菜单**：`QSystemTrayIcon` /
+`KStatusNotifierItem` 会在一条独立连接上导出 `org.kde.StatusNotifierItem`，
+并把右键菜单挂在裸 `/MenuBar`（和 `com.canonical.dbusmenu`）上。它和真正的
+应用菜单栏 (`/MenuBar/<n>`，或 libdbusmenu-qt 的裸 `/MenuBar`) 用同一个 pid，
+只按路径排序会让面板显示「显示主窗口 / 退出」而不是「文件 / 编辑 / 视图」。
+
+因此对裸 `/MenuBar` 会再 `Introspect /StatusNotifierItem` 一次：同一条连接上
+有 `org.kde.StatusNotifierItem` 就说明它是托盘菜单，不进入注册表；
+`/MenuBar/<n>` 一定是应用菜单栏，不做这次额外往返。即使两种记录同时残留，
+`GetMenuForPid` / 面板本地查找也统一用 `appmenuEntryIsPreferred()` 优先
+`/MenuBar/<n>`；外部旧版 registrar 返回裸 `/MenuBar` 时，`activatePid()` 还会
+用本地 `GetMenuList` 再校正一次，不必等 registrar 升级。
 
 ## 构建与安装
 
@@ -208,6 +221,9 @@ onActivePidChanged: {
 busctl --user call :1.x /Control test.appmenu.Control DropMenu s /MenuBar/2
 # 走 RegisterSurfaceMenu(uss)，模拟 hypr-appmenu 插件
 ./build/test/appmenu-fakeapp --register
+# 同一个 pid 同时导出应用菜单栏和托盘菜单（托盘在独立连接的裸 /MenuBar 上）：
+# 顶栏应绑定 /MenuBar/1 并显示 File/Edit/View，而不是托盘项
+./build/test/appmenu-fakeapp --tray
 
 # 演示程序：模块自己占 registrar，不依赖任何外部进程
 ./build/test/appmenu-test
@@ -225,7 +241,8 @@ APPMENU_TEST_SCREENSHOT=/tmp/menu.png ./build/test/appmenu-test --pid 1234
 * **同一进程多窗口**：一个进程的每个窗口会导出自己的 `/MenuBar/<n>`，但 Wayland
   下能拿到的关联键只有 pid，所以无法判断焦点窗口对应哪一个。当前策略：
   * 同一 pid 有多条记录时，`GetMenuForPid` / `GetMenuForWindow` / 面板本地查找
-    统一取 **path 最小**的一条（不是 QHash 顺序），结果确定、切换和刷新不会来回跳；
+    统一优先 `/MenuBar/<n>`（应用菜单栏），其次按 **path 最小**（不是 QHash
+    顺序），结果确定、切换和刷新不会来回跳；托盘菜单在发现阶段已被排除；
   * `UnregisterWindow(pid)` 命中多条时不再把该进程的菜单全部删掉（那会让同一应用
     剩下的窗口失去菜单），而是重新 `Introspect` 对账，只移除真正消失的 path；
   * 真正的窗口级绑定需要 `org_kde_kwin_appmenu`（应用把菜单挂到 surface 上），

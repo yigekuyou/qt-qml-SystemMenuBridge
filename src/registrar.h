@@ -96,6 +96,12 @@ private:
 
     void scanExistingNames();
     void probe(const QString &service, int attempt);
+    /// 探测完成后统一收尾：空结果安排重试，有结果则写进注册表
+    void finishProbe(const QString &service, int attempt, const QStringList &paths);
+    /// 确认一条连接是不是 StatusNotifierItem（托盘）宿主，决定裸 /MenuBar 去留
+    void probeStatusNotifier(const QString &service, int attempt, const QStringList &paths);
+    /// 释放一个在飞的探测名额并发下一枪
+    void releaseProbeSlot();
     void scheduleProbe(const QString &service, int attempt);
     void syncMenus(const QString &service, const QStringList &paths);
     void removeService(const QString &service);
@@ -126,6 +132,7 @@ private:
     QQueue<ProbeRequest> m_probeQueue;
     QTimer *m_pump = nullptr;   // 探测发车节流用的单次定时器
     int m_inFlight = 0;         // 还没回来的 Introspect 数
+    QSet<QString> m_trayHosts;  // 导出 /StatusNotifierItem 的连接：裸 /MenuBar 是托盘菜单
     QSet<QString> m_unreachable;        // 叫不醒的连接：owner 变化前不再探测
     QHash<QString, int> m_timeouts;     // 连续超时次数
     QHash<QString, qint64> m_retryAfter; // 下次最早可以再试的时间（ms since epoch）

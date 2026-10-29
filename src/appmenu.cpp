@@ -73,10 +73,5 @@ void AppMenu::reload()
 
 bool AppMenu::hasMenuFor(uint pid) const
 {
-    const QVariantList list = m_service->menus();
-    for (const QVariant &item : list) {
-        if (item.toMap().value(QStringLiteral("pid")).toUInt() == pid)
-            return true;
-    }
-    return false;
+    return m_service->hasMenuFor(pid);
 }

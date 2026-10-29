@@ -187,3 +187,31 @@ QList<AppMenuEntry> appmenuEntries(const QVariant &value)
 
     return qdbus_cast<QList<AppMenuEntry>>(arg);
 }
+
+namespace {
+
+/// 0 = 应用菜单栏，1 = 裸 /MenuBar（托盘菜单的约定位置）
+int menuKindRank(const QString &path)
+{
+    return path == QLatin1String("/MenuBar") ? 1 : 0;
+}
+
+} // namespace
+
+bool appmenuEntryIsPreferred(const AppMenuEntry &candidate, const AppMenuEntry &current)
+{
+    if (candidate.path.isEmpty())
+        return false;
+    if (current.path.isEmpty())
+        return true;
+
+    const int candidateRank = menuKindRank(candidate.path);
+    const int currentRank = menuKindRank(current.path);
+    if (candidateRank != currentRank)
+        return candidateRank < currentRank;
+
+    // 同一等级（同一进程多窗口）也保持确定结果，不受 QHash 遍历顺序影响
+    if (candidate.path != current.path)
+        return candidate.path < current.path;
+    return candidate.service < current.service;
+}

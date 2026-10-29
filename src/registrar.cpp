@@ -282,14 +282,15 @@ QList<AppMenuEntry> AppMenuRegistrar::entries() const
 AppMenuEntry AppMenuRegistrar::entryForPid(uint pid) const
 {
     // 一个进程可能有多个窗口，每个窗口导出自己的 /MenuBar/<n>，所以同一 pid
-    // 会对应多条记录。m_menus 是 QHash，直接返回"第一条"会随哈希顺序变化；
-    // 这里固定取 path 最小的一条，让 GetMenuForPid、GetMenuForWindow 和面板
-    // 本地的 findEntryForPid 得到同一个结果（切换/刷新时不会来回跳）。
+    // 会对应多条记录；此外 QSystemTrayIcon 还会在裸 /MenuBar 上导出托盘菜单。
+    // m_menus 是 QHash，直接返回"第一条"会随哈希顺序变化；这里用统一的
+    // appmenuEntryIsPreferred（应用菜单栏优先，其次 path 最小）选出确定的结果，
+    // 让 GetMenuForPid、GetMenuForWindow 和面板本地的 findEntryForPid 保持一致。
     AppMenuEntry best;
     for (const AppMenuEntry &entry : m_menus) {
-        if (entry.pid != pid || entry.path.isEmpty())
+        if (entry.pid != pid)
             continue;
-        if (best.path.isEmpty() || entry.path < best.path)
+        if (appmenuEntryIsPreferred(entry, best))
             best = entry;
     }
     return best;
@@ -299,9 +300,9 @@ AppMenuEntry AppMenuRegistrar::entryForWindow(uint windowId) const
 {
     AppMenuEntry best;
     for (const AppMenuEntry &entry : m_menus) {
-        if (entry.windowId != windowId || entry.path.isEmpty())
+        if (entry.windowId != windowId)
             continue;
-        if (best.path.isEmpty() || entry.path < best.path)
+        if (appmenuEntryIsPreferred(entry, best))
             best = entry;
     }
 
@@ -534,12 +535,13 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
     connect(watcher, &QDBusPendingCallWatcher::finished, this,
             [this, service, attempt](QDBusPendingCallWatcher *w) {
                 w->deleteLater();
-                if (m_inFlight > 0)
-                    --m_inFlight;
-                pumpProbeQueue(); // 有空位了，放下一枪
 
-                if (!m_services.contains(service))
+                // 注意：这里先不释放探测名额。若发现裸 /MenuBar，还要再问一次
+                // /StatusNotifierItem 才能判断它是应用菜单栏还是托盘菜单。
+                if (!m_services.contains(service)) {
+                    releaseProbeSlot();
                     return;
+                }
 
                 if (w->isError()) {
                     const QString errorName = w->error().name();
@@ -549,6 +551,7 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                     if (silent) {
                         // 对端根本没在读消息，重试只会继续给它堆未读
                         noteProbeTimeout(service);
+                        releaseProbeSlot();
                         return;
                     }
 
@@ -556,6 +559,7 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                     m_timeouts.remove(service);
                     if (attempt < kMaxProbeAttempts)
                         scheduleProbe(service, attempt + 1);
+                    releaseProbeSlot();
                     return;
                 }
 
@@ -571,14 +575,107 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                 if (paths.isEmpty()) {
                     if (attempt < kMaxProbeAttempts)
                         scheduleProbe(service, attempt + 1);
+                    releaseProbeSlot();
                     return;
                 }
 
-                m_probeAttempts.remove(service);
-                m_timeouts.remove(service);
-                m_retryAfter.remove(service);
-                syncMenus(service, paths);
+                const QString menuBarPath = QString::fromLatin1(kMenuBarPath);
+                if (paths.contains(menuBarPath) && !m_trayHosts.contains(service)) {
+                    // 只对裸 /MenuBar 多问一次：/MenuBar/<n> 一定是应用菜单栏，
+                    // 不需要为它付额外的总线往返。
+                    probeStatusNotifier(service, attempt, paths);
+                    return;
+                }
+
+                if (m_trayHosts.contains(service)) {
+                    paths.removeAll(menuBarPath);
+                    if (paths.isEmpty()) {
+                        // 已确认是托盘连接，剩下的裸 /MenuBar 不会变成应用菜单栏
+                        m_probeAttempts.remove(service);
+                        releaseProbeSlot();
+                        return;
+                    }
+                }
+
+                finishProbe(service, attempt, paths);
+                releaseProbeSlot();
             });
+}
+
+void AppMenuRegistrar::finishProbe(const QString &service, int attempt, const QStringList &paths)
+{
+    if (!m_services.contains(service))
+        return;
+
+    if (paths.isEmpty()) {
+        if (attempt < kMaxProbeAttempts)
+            scheduleProbe(service, attempt + 1);
+        return;
+    }
+
+    m_probeAttempts.remove(service);
+    m_timeouts.remove(service);
+    m_retryAfter.remove(service);
+    syncMenus(service, paths);
+}
+
+void AppMenuRegistrar::probeStatusNotifier(const QString &service, int attempt,
+                                           const QStringList &paths)
+{
+    // StatusNotifierItem（托盘）和它的上下文菜单在同一条连接上：
+    //   - Qt 的 QSystemTrayIcon 专门开一条连接，导出 /StatusNotifierItem + /MenuBar；
+    //   - KStatusNotifierItem / libayatana 也一样用独立连接。
+    // 裸 /MenuBar 是托盘菜单的约定路径，不能当作应用菜单栏。这里只做判断，
+    // 真正带子节点（/MenuBar/<n>）的应用菜单栏仍然保留。
+    QDBusMessage call = QDBusMessage::createMethodCall(
+        service, QStringLiteral("/StatusNotifierItem"),
+        QStringLiteral("org.freedesktop.DBus.Introspectable"), QStringLiteral("Introspect"));
+
+    auto *watcher = new QDBusPendingCallWatcher(
+        QDBusConnection::sessionBus().asyncCall(call, kProbeTimeoutMs), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this,
+            [this, service, attempt, paths](QDBusPendingCallWatcher *w) {
+                w->deleteLater();
+
+                // 名字在探测过程中消失了，onNameOwnerChanged 已经清理过注册表
+                if (!m_services.contains(service)) {
+                    releaseProbeSlot();
+                    return;
+                }
+
+                // 探测失败（没有这个对象、超时）时按普通应用连接处理：
+                // 宁可多留一个候选，也不要误删真正的菜单。
+                bool trayHost = false;
+                if (!w->isError()) {
+                    const QVariantList args = w->reply().arguments();
+                    const QString xml = args.isEmpty() ? QString() : args.at(0).toString();
+                    trayHost = xml.contains(QLatin1String("org.kde.StatusNotifierItem"));
+                }
+
+                QStringList filtered = paths;
+                if (trayHost) {
+                    m_trayHosts.insert(service);
+                    filtered.removeAll(QString::fromLatin1(kMenuBarPath));
+                }
+
+                if (trayHost && filtered.isEmpty()) {
+                    // 托盘连接上不会再长出应用菜单栏（Qt / KStatusNotifierItem
+                    // 都把托盘放在独立连接上），不用再走 15 次 2s 重试。
+                    m_probeAttempts.remove(service);
+                    releaseProbeSlot();
+                    return;
+                }
+
+                finishProbe(service, attempt, filtered);
+                releaseProbeSlot();
+            });
+}
+
+void AppMenuRegistrar::releaseProbeSlot()
+{
+    if (m_inFlight > 0)
+        --m_inFlight;
+    pumpProbeQueue();
 }
 
 void AppMenuRegistrar::enqueueProbe(const QString &service, int attempt)
@@ -690,6 +787,7 @@ void AppMenuRegistrar::onNameOwnerChanged(const QString &name, const QString &ol
         m_unreachable.remove(name);
         m_timeouts.remove(name);
         m_retryAfter.remove(name);
+        m_trayHosts.remove(name);
         m_pidCache.remove(name);
         enqueueProbe(name, 0);
     } else {
@@ -698,6 +796,7 @@ void AppMenuRegistrar::onNameOwnerChanged(const QString &name, const QString &ol
         m_unreachable.remove(name);
         m_timeouts.remove(name);
         m_retryAfter.remove(name);
+        m_trayHosts.remove(name);
         m_pidCache.remove(name);
         removeService(name);
     }

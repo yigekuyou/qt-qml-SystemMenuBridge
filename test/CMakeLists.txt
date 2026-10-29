@@ -30,3 +30,23 @@ target_link_libraries(appmenu-test PRIVATE Qt6::Quick Qt6::Qml appmenu)
 target_compile_definitions(appmenu-test PRIVATE
     APPMENU_QML_IMPORT_DIR="${CMAKE_CURRENT_BINARY_DIR}"
 )
+
+# ---------------------------------------------------------------------------
+# appmenu-bind-test：托盘菜单 vs 应用菜单栏的回归测试
+# 直接使用 AppMenuService（不需要 QML），由 fakeapp --tray 制造两份同 pid 菜单
+# ---------------------------------------------------------------------------
+qt_add_executable(appmenu-bind-test
+    bindtest.cpp
+)
+target_link_libraries(appmenu-bind-test PRIVATE Qt6::Core Qt6::DBus Qt6::Qml appmenu)
+target_include_directories(appmenu-bind-test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_target_properties(appmenu-bind-test PROPERTIES AUTOMOC ON)
+
+# 用独立的 dbus-daemon，避免和桌面上已有的 registrar（Quickshell / KDE）冲突
+find_program(DBUS_RUN_SESSION dbus-run-session)
+if(DBUS_RUN_SESSION)
+    add_test(NAME appmenu-tray-vs-menubar
+        COMMAND ${DBUS_RUN_SESSION} --
+                $<TARGET_FILE:appmenu-bind-test> $<TARGET_FILE:appmenu-fakeapp>
+    )
+endif()

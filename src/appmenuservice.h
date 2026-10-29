@@ -52,6 +52,8 @@ public:
     /// 本进程是否占住了 com.canonical.AppMenu.Registrar
     bool ownsRegistrar() const;
     QVariantList menus() const;
+    /// 该进程有没有可绑定的菜单（托盘菜单不算）
+    Q_INVOKABLE bool hasMenuFor(uint pid) const;
     uint activePid() const;
     QString activeService() const;
     QString activePath() const;

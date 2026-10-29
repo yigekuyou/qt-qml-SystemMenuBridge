@@ -5,7 +5,9 @@
  *   内嵌 registrar 发现 /MenuBar/1 → AppMenuService 按 pid 绑定 → QML 渲染。
  *
  * --menus N 会在同一条总线上导出 /MenuBar/1 .. /MenuBar/N，模拟一个进程开
- * 多个窗口；/Control 上的 DropMenu(path) 可以在运行中"关掉一个窗口"。
+ * 多个窗口；--tray 会在另一条连接上导出 StatusNotifierItem + 裸 /MenuBar
+ * 的托盘菜单，模拟"托盘菜单抢走真正应用菜单栏"的场景；/Control 上的
+ * DropMenu(path) 可以在运行中"关掉一个窗口"。
  *
  * 它不创建任何窗口（QCoreApplication），菜单树写死在代码里，
  * 点击事件会打印到 stdout，勾选项会真的切换并广播 LayoutUpdated。
@@ -48,6 +50,11 @@ FakeItem makeSeparator(qint32 id)
     item.separator = true;
     return item;
 }
+
+enum class FakeMenuKind {
+    Application,
+    Tray,
+};
 
 QList<FakeItem> buildTree(int windowIndex = 0)
 {
@@ -92,6 +99,18 @@ QList<FakeItem> buildTree(int windowIndex = 0)
     return {file, edit, view};
 }
 
+/// 托盘上下文菜单：挂在独立连接（StatusNotifierItem）的裸 /MenuBar 上，
+/// 用来复现"真菜单栏 /MenuBar/1 被托盘菜单 /MenuBar 抢走"的场景
+QList<FakeItem> buildTrayTree()
+{
+    return {
+        {1, QStringLiteral("_Show Main Window"), false, true, {}, 0, {}},
+        {2, QStringLiteral("_Hide Main Window"), false, true, {}, 0, {}},
+        makeSeparator(3),
+        {4, QStringLiteral("_Quit"), false, true, {}, 0, {}},
+    };
+}
+
 } // namespace
 
 class FakeMenu;
@@ -133,9 +152,10 @@ class FakeMenu : public QObject
     Q_OBJECT
 
 public:
-    explicit FakeMenu(int windowIndex = 0, QObject *parent = nullptr)
+    explicit FakeMenu(int windowIndex = 0, FakeMenuKind kind = FakeMenuKind::Application,
+                      QObject *parent = nullptr)
         : QObject(parent)
-        , m_items(buildTree(windowIndex))
+        , m_items(kind == FakeMenuKind::Tray ? buildTrayTree() : buildTree(windowIndex))
     {
     }
 
@@ -347,6 +367,35 @@ private:
     DropHandler m_handler;
 };
 
+/**
+ * 最小可用的 org.kde.StatusNotifierItem 导出。registrar 只需要在
+ * /StatusNotifierItem 的 Introspect 结果里看到这个接口，就能判定同一条
+ * 连接上的裸 /MenuBar 是托盘上下文菜单，而不是应用菜单栏。
+ */
+class FakeStatusNotifierItem : public QDBusAbstractAdaptor
+{
+    Q_OBJECT
+    Q_CLASSINFO("D-Bus Interface", "org.kde.StatusNotifierItem")
+    Q_PROPERTY(QString Id READ id CONSTANT)
+    Q_PROPERTY(QString Title READ title CONSTANT)
+
+public:
+    explicit FakeStatusNotifierItem(QObject *parent)
+        : QDBusAbstractAdaptor(parent)
+    {
+    }
+
+    QString id() const { return QStringLiteral("appmenu-fakeapp"); }
+    QString title() const { return QStringLiteral("appmenu fake tray"); }
+
+public Q_SLOTS:
+    void Activate(int x, int y)
+    {
+        Q_UNUSED(x)
+        Q_UNUSED(y)
+    }
+};
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -370,6 +419,11 @@ int main(int argc, char *argv[])
                        "simulating one process with N windows."),
         QStringLiteral("n"), QStringLiteral("1"));
     parser.addOption(menusOption);
+    QCommandLineOption trayOption(
+        QStringLiteral("tray"),
+        QStringLiteral("Also export a StatusNotifierItem tray menu at /MenuBar on a "
+                       "separate connection (reproduces the tray-menu-vs-app-menu case)."));
+    parser.addOption(trayOption);
     parser.process(app);
 
     appmenuRegisterDBusTypes();
@@ -390,7 +444,7 @@ int main(int argc, char *argv[])
     QHash<QString, FakeMenu *> menus;
     for (int i = 1; i <= menuCount; ++i) {
         const QString path = QStringLiteral("/MenuBar/%1").arg(i);
-        auto *menu = new FakeMenu(menuCount > 1 ? i : 0, &app);
+        auto *menu = new FakeMenu(menuCount > 1 ? i : 0, FakeMenuKind::Application, &app);
         auto *adaptor = new FakeMenuAdaptor(menu);
         Q_UNUSED(adaptor)
 
@@ -399,6 +453,40 @@ int main(int argc, char *argv[])
             return 1;
         }
         menus.insert(path, menu);
+    }
+
+    // 托盘图标：QSystemTrayIcon / KStatusNotifierItem 会另开一条连接，
+    // 导出 /StatusNotifierItem 和裸 /MenuBar 的上下文菜单。真实应用里这条
+    // 菜单的 pid 和主菜单相同，旧逻辑按 path 字典序会选中它。
+    QString trayService;
+    QDBusConnection trayBus = QDBusConnection::sessionBus();
+    if (parser.isSet(trayOption)) {
+        trayService = QStringLiteral("org.kde.StatusNotifierItem-%1-1")
+                          .arg(QCoreApplication::applicationPid());
+        trayBus = QDBusConnection::connectToBus(QDBusConnection::SessionBus, trayService);
+        if (!trayBus.isConnected()) {
+            qCritical() << "cannot connect tray bus" << trayService;
+            return 1;
+        }
+
+        auto *sni = new QObject(&app);
+        new FakeStatusNotifierItem(sni);
+        if (!trayBus.registerObject(QStringLiteral("/StatusNotifierItem"), sni,
+                                    QDBusConnection::ExportAdaptors
+                                        | QDBusConnection::ExportAllSlots
+                                        | QDBusConnection::ExportAllProperties)) {
+            qCritical() << "cannot register /StatusNotifierItem";
+            return 1;
+        }
+
+        auto *trayMenu = new FakeMenu(0, FakeMenuKind::Tray, &app);
+        new FakeMenuAdaptor(trayMenu);
+        if (!trayBus.registerObject(QStringLiteral("/MenuBar"), trayMenu)) {
+            qCritical() << "cannot register tray /MenuBar";
+            return 1;
+        }
+
+        qInfo() << "[fakeapp] exporting tray menu at /MenuBar on" << trayBus.baseService();
     }
 
     auto *control = new FakeControl([&bus, &menus](const QString &path) {

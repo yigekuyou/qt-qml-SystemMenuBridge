@@ -100,6 +100,11 @@ QVariantList AppMenuService::menus() const
     return list;
 }
 
+bool AppMenuService::hasMenuFor(uint pid) const
+{
+    return !findEntryForPid(pid).path.isEmpty();
+}
+
 uint AppMenuService::activePid() const
 {
     return m_activePid;
@@ -212,14 +217,15 @@ void AppMenuService::reload()
 
 AppMenuEntry AppMenuService::findEntryForPid(uint pid) const
 {
-    // 同一进程的多个窗口会有多条记录（同一个 pid、不同 path）。这里和
-    // AppMenuRegistrar::entryForPid 用同一条规则（取 path 最小的一条），
-    // 免得本地列表和 registrar 的 GetMenuForPid 结果不一致导致来回跳。
+    // 同一进程的多个窗口会有多条记录（同一个 pid、不同 path）；有托盘的应用
+    // 还会多一条裸 /MenuBar 的托盘菜单。这里和 AppMenuRegistrar::entryForPid
+    // 用同一个 appmenuEntryIsPreferred（应用菜单栏优先），免得本地列表和
+    // registrar 的 GetMenuForPid 结果不一致导致来回跳。
     AppMenuEntry best;
     for (const AppMenuEntry &entry : m_entries) {
-        if (entry.pid != pid || entry.path.isEmpty())
+        if (entry.pid != pid)
             continue;
-        if (best.path.isEmpty() || entry.path < best.path)
+        if (appmenuEntryIsPreferred(entry, best))
             best = entry;
     }
     return best;
@@ -273,7 +279,14 @@ void AppMenuService::activatePid(uint pid)
             }
 
             const QVariantList args = reply.arguments();
-            const AppMenuEntry entry = args.isEmpty() ? AppMenuEntry() : appmenuEntry(args.at(0));
+            AppMenuEntry entry = args.isEmpty() ? AppMenuEntry() : appmenuEntry(args.at(0));
+
+            // 外部 registrar（旧版模块 / KDE）可能仍按 path 字典序返回裸
+            // /MenuBar 的托盘菜单。GetMenuList 里通常也有同一 pid 的
+            // /MenuBar/<n>，本地按统一规则再挑一次，避免被旧 registrar 带偏。
+            const AppMenuEntry local = findEntryForPid(pid);
+            if (appmenuEntryIsPreferred(local, entry))
+                entry = local;
 
             if (!entry.windowId || entry.path.isEmpty()) {
                 // registrar 里还没有这个 pid 的菜单，等 WindowRegistered 信号再来一次

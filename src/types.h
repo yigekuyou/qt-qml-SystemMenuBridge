@@ -68,4 +68,18 @@ QList<DBusMenuPropertySet> appmenuPropertySets(const QVariant &value);
 AppMenuEntry appmenuEntry(const QVariant &value);
 QList<AppMenuEntry> appmenuEntries(const QVariant &value);
 
+/**
+ * 同一 pid 的多条菜单记录里，candidate 是否比 current 更适合当作"应用菜单栏"。
+ *
+ * 一个进程完全可能同时导出两份 com.canonical.dbusmenu：
+ *   - 应用菜单栏：Qt 内建 QDBusMenuBar 挂在 /MenuBar/<n>；
+ *   - 托盘上下文菜单：QSystemTrayIcon / StatusNotifierItem 通常挂在裸 /MenuBar。
+ * 只按 path 字典序会把 "/MenuBar" 排在 "/MenuBar/1" 前面，于是面板显示的是
+ * "显示主窗口 / 退出" 这类托盘项，真正的 文件/编辑/视图 反而看不到。
+ *
+ * 规则：/MenuBar/<n> 优先于裸 /MenuBar；同等级再按 path、service 排序，
+ * 保证哈希遍历顺序不会让绑定结果来回跳。
+ */
+bool appmenuEntryIsPreferred(const AppMenuEntry &candidate, const AppMenuEntry &current);
+
 #endif // APPMENU_TYPES_H
