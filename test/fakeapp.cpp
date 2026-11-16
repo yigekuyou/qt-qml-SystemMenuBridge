@@ -353,18 +353,21 @@ class FakeControl : public QObject
 public:
     using DropHandler = std::function<bool(const QString &)>;
 
-    explicit FakeControl(DropHandler handler, QObject *parent = nullptr)
+    explicit FakeControl(DropHandler handler, DropHandler addHandler, QObject *parent = nullptr)
         : QObject(parent)
         , m_handler(std::move(handler))
+        , m_addHandler(std::move(addHandler))
     {
     }
 
 public Q_SLOTS:
     bool DropMenu(const QString &path) { return m_handler && m_handler(path); }
+    bool AddMenu(const QString &path) { return m_addHandler && m_addHandler(path); }
     void Quit() { QCoreApplication::quit(); }
 
 private:
     DropHandler m_handler;
+    DropHandler m_addHandler;
 };
 
 /**
@@ -490,12 +493,29 @@ int main(int argc, char *argv[])
     }
 
     auto *control = new FakeControl([&bus, &menus](const QString &path) {
+        if (path == QLatin1String("/MenuBar")) {
+            bus.unregisterObject(path, QDBusConnection::UnregisterTree);
+            qDeleteAll(menus);
+            menus.clear();
+            return true;
+        }
         FakeMenu *menu = menus.take(path);
         if (!menu)
             return false;
         bus.unregisterObject(path);
         menu->deleteLater();
         qInfo() << "[fakeapp] dropped menu" << path;
+        return true;
+    }, [&bus, &menus, &app](const QString &path) {
+        if (!path.startsWith(QLatin1String("/MenuBar/")) || menus.contains(path))
+            return false;
+        auto *menu = new FakeMenu(0, FakeMenuKind::Application, &app);
+        new FakeMenuAdaptor(menu);
+        if (!bus.registerObject(path, menu)) {
+            delete menu;
+            return false;
+        }
+        menus.insert(path, menu);
         return true;
     }, &app);
     if (!bus.registerObject(QStringLiteral("/Control"), control,

@@ -209,8 +209,14 @@ void AppMenuService::reload()
             activatePid(m_pendingPid);
         else if (m_activePid) {
             const AppMenuEntry entry = findEntryForPid(m_activePid);
-            if (entry.windowId && entry.path != m_activePath)
-                applyActive(entry);
+            if (entry.windowId) {
+                if (entry.path != m_activePath || entry.service != m_activeService)
+                    applyActive(entry);
+            } else {
+                const uint pid = m_activePid;
+                clearActive();
+                m_pendingPid = pid; // 暂时没有菜单，重建后自动恢复绑定
+            }
         }
     });
 }

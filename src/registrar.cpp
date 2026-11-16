@@ -22,8 +22,10 @@ constexpr auto kMenuBarPath = "/MenuBar";
 // 应用启动后可能过一会才创建菜单栏，所以对新出现的名字做有限次重试
 constexpr int kMaxProbeAttempts = 15;
 constexpr int kProbeIntervalMs = 2000;
-// 之后每 60s 低频重扫一次，兜住"多窗口应用后来才导出 /MenuBar/2"这类情况
+// 尚未发现菜单的连接每 60s 低频重扫一次
 constexpr int kRescanIntervalMs = 60000;
+// 已发现菜单的连接需要持续对账：窗口关闭或菜单重建不会改变总线 owner。
+constexpr int kMenuRefreshIntervalMs = 2000;
 
 // 单次 Introspect 的上限。Qt 默认是 25s：总线上长期存在一些不跑事件循环的
 // 连接（Qt 里跨线程 QDBusConnection 很常见），对它们探测时调用会一直挂着，
@@ -247,17 +249,22 @@ bool AppMenuRegistrar::start(QString *errorMessage, bool replaceExisting)
 
     scanExistingNames();
 
+    // 已知菜单连接单独刷新，继续使用有超时和并发上限的探测队列。
+    auto *refresh = new QTimer(this);
+    refresh->setInterval(kMenuRefreshIntervalMs);
+    connect(refresh, &QTimer::timeout, this, [this]() {
+        for (const QString &service : std::as_const(m_menuServices))
+            enqueueProbe(service, kMaxProbeAttempts);
+    });
+    refresh->start();
+
     // 低频重扫：只针对还没发现菜单的服务，而且每次只补一枪（attempt 已达上限，
     // 不会再触发 2s 一串的重试），用慢速轮询等应用后来才导出的菜单。
     auto *rescan = new QTimer(this);
     rescan->setInterval(kRescanIntervalMs);
     connect(rescan, &QTimer::timeout, this, [this]() {
-        QSet<QString> withMenu;
-        for (const AppMenuEntry &entry : std::as_const(m_menus))
-            withMenu.insert(entry.service);
-
         for (const QString &service : std::as_const(m_services)) {
-            if (withMenu.contains(service) || probeSuppressed(service))
+            if (m_menuServices.contains(service) || probeSuppressed(service))
                 continue;
             enqueueProbe(service, kMaxProbeAttempts);
         }
@@ -539,7 +546,7 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                 // 注意：这里先不释放探测名额。若发现裸 /MenuBar，还要再问一次
                 // /StatusNotifierItem 才能判断它是应用菜单栏还是托盘菜单。
                 if (!m_services.contains(service)) {
-                    releaseProbeSlot();
+                    releaseProbeSlot(service);
                     return;
                 }
 
@@ -551,15 +558,19 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                     if (silent) {
                         // 对端根本没在读消息，重试只会继续给它堆未读
                         noteProbeTimeout(service);
-                        releaseProbeSlot();
+                        releaseProbeSlot(service);
                         return;
                     }
+
+                    // 只有明确的对象不存在才清理；超时/权限等错误保留旧记录。
+                    if (errorName == QLatin1String("org.freedesktop.DBus.Error.UnknownObject"))
+                        syncMenus(service, {});
 
                     // 这个连接没有导出 /MenuBar，稍后再试几次
                     m_timeouts.remove(service);
                     if (attempt < kMaxProbeAttempts)
                         scheduleProbe(service, attempt + 1);
-                    releaseProbeSlot();
+                    releaseProbeSlot(service);
                     return;
                 }
 
@@ -573,9 +584,10 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                     paths.prepend(QString::fromLatin1(kMenuBarPath));
 
                 if (paths.isEmpty()) {
+                    syncMenus(service, {});
                     if (attempt < kMaxProbeAttempts)
                         scheduleProbe(service, attempt + 1);
-                    releaseProbeSlot();
+                    releaseProbeSlot(service);
                     return;
                 }
 
@@ -592,13 +604,13 @@ void AppMenuRegistrar::probe(const QString &service, int attempt)
                     if (paths.isEmpty()) {
                         // 已确认是托盘连接，剩下的裸 /MenuBar 不会变成应用菜单栏
                         m_probeAttempts.remove(service);
-                        releaseProbeSlot();
+                        releaseProbeSlot(service);
                         return;
                     }
                 }
 
                 finishProbe(service, attempt, paths);
-                releaseProbeSlot();
+                releaseProbeSlot(service);
             });
 }
 
@@ -616,6 +628,7 @@ void AppMenuRegistrar::finishProbe(const QString &service, int attempt, const QS
     m_probeAttempts.remove(service);
     m_timeouts.remove(service);
     m_retryAfter.remove(service);
+    m_menuServices.insert(service);
     syncMenus(service, paths);
 }
 
@@ -639,7 +652,7 @@ void AppMenuRegistrar::probeStatusNotifier(const QString &service, int attempt,
 
                 // 名字在探测过程中消失了，onNameOwnerChanged 已经清理过注册表
                 if (!m_services.contains(service)) {
-                    releaseProbeSlot();
+                    releaseProbeSlot(service);
                     return;
                 }
 
@@ -662,17 +675,18 @@ void AppMenuRegistrar::probeStatusNotifier(const QString &service, int attempt,
                     // 托盘连接上不会再长出应用菜单栏（Qt / KStatusNotifierItem
                     // 都把托盘放在独立连接上），不用再走 15 次 2s 重试。
                     m_probeAttempts.remove(service);
-                    releaseProbeSlot();
+                    releaseProbeSlot(service);
                     return;
                 }
 
                 finishProbe(service, attempt, filtered);
-                releaseProbeSlot();
+                releaseProbeSlot(service);
             });
 }
 
-void AppMenuRegistrar::releaseProbeSlot()
+void AppMenuRegistrar::releaseProbeSlot(const QString &service)
 {
+    m_scheduledProbes.remove(service);
     if (m_inFlight > 0)
         --m_inFlight;
     pumpProbeQueue();
@@ -680,9 +694,11 @@ void AppMenuRegistrar::releaseProbeSlot()
 
 void AppMenuRegistrar::enqueueProbe(const QString &service, int attempt)
 {
-    if (!m_services.contains(service) || probeSuppressed(service))
+    if (!m_services.contains(service) || probeSuppressed(service)
+        || m_scheduledProbes.contains(service))
         return;
 
+    m_scheduledProbes.insert(service);
     ProbeRequest req;
     req.service = service;
     req.attempt = attempt;
@@ -697,8 +713,10 @@ void AppMenuRegistrar::pumpProbeQueue()
             return; // 满了，等某个探测回来时再发车
 
         const ProbeRequest req = m_probeQueue.dequeue();
-        if (!m_services.contains(req.service) || probeSuppressed(req.service))
+        if (!m_services.contains(req.service) || probeSuppressed(req.service)) {
+            m_scheduledProbes.remove(req.service);
             continue; // 名字没了 / 已经判定叫不醒
+        }
 
         probe(req.service, req.attempt);
         if (m_pump)
@@ -739,10 +757,15 @@ void AppMenuRegistrar::noteProbeTimeout(const QString &service)
 
 void AppMenuRegistrar::syncMenus(const QString &service, const QStringList &paths)
 {
+    // 仅对探测的 /MenuBar 子树对账，保留显式注册在其它路径上的菜单。
+    // 已发现连接即使暂时没有菜单也继续刷新，以便捕获随后重建的对象。
     // 先清掉已经不存在的路径（例如菜单对象重建后编号变了）
     QList<AppMenuEntry> stale;
     for (auto it = m_menus.begin(); it != m_menus.end();) {
-        if (it->service == service && !paths.contains(it->path)) {
+        if (it->service == service
+            && (it->path == QLatin1String(kMenuBarPath)
+                || it->path.startsWith(QLatin1String("/MenuBar/")))
+            && !paths.contains(it->path)) {
             stale.append(*it);
             it = m_menus.erase(it);
         } else {
@@ -792,6 +815,7 @@ void AppMenuRegistrar::onNameOwnerChanged(const QString &name, const QString &ol
         enqueueProbe(name, 0);
     } else {
         m_services.remove(name);
+        m_menuServices.remove(name);
         m_probeAttempts.remove(name);
         m_unreachable.remove(name);
         m_timeouts.remove(name);

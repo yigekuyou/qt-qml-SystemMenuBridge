@@ -101,7 +101,7 @@ private:
     /// 确认一条连接是不是 StatusNotifierItem（托盘）宿主，决定裸 /MenuBar 去留
     void probeStatusNotifier(const QString &service, int attempt, const QStringList &paths);
     /// 释放一个在飞的探测名额并发下一枪
-    void releaseProbeSlot();
+    void releaseProbeSlot(const QString &service);
     void scheduleProbe(const QString &service, int attempt);
     void syncMenus(const QString &service, const QStringList &paths);
     void removeService(const QString &service);
@@ -126,10 +126,12 @@ private:
     QHash<QString, AppMenuEntry> m_menus; // key = service|path
     QHash<QString, int> m_probeAttempts;
     QSet<QString> m_services; // 当前在总线上的唯一名
+    QSet<QString> m_menuServices; // 曾发现菜单的连接，持续刷新直到断线
     QString m_ownUniqueName;
     uint m_synthetic = 0x80000000u;
 
     QQueue<ProbeRequest> m_probeQueue;
+    QSet<QString> m_scheduledProbes; // 同一连接最多一个排队/在飞探测，避免定时刷新积压
     QTimer *m_pump = nullptr;   // 探测发车节流用的单次定时器
     int m_inFlight = 0;         // 还没回来的 Introspect 数
     QSet<QString> m_trayHosts;  // 导出 /StatusNotifierItem 的连接：裸 /MenuBar 是托盘菜单

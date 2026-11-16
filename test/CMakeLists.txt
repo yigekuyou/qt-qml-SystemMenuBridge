@@ -50,3 +50,14 @@ if(DBUS_RUN_SESSION)
                 $<TARGET_FILE:appmenu-bind-test> $<TARGET_FILE:appmenu-fakeapp>
     )
 endif()
+
+# 菜单对象增删/重建：保持同一总线连接，不发送显式注册通知。
+qt_add_executable(appmenu-lifecycle-test lifecycletest.cpp)
+target_link_libraries(appmenu-lifecycle-test PRIVATE Qt6::Core Qt6::DBus Qt6::Qml appmenu)
+target_include_directories(appmenu-lifecycle-test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(DBUS_RUN_SESSION)
+    add_test(NAME appmenu-menu-lifecycle
+        COMMAND ${DBUS_RUN_SESSION} --
+                $<TARGET_FILE:appmenu-lifecycle-test> $<TARGET_FILE:appmenu-fakeapp>
+    )
+endif()
